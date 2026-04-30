@@ -27,7 +27,11 @@ from ..models.wan_video_mot import MotWanModel
 from ..models.wav2vec import WanS2VAudioEncoder
 from ..models.longcat_video_dit import LongCatVideoTransformer3DModel
 import random
-from ..utils.visualize_video_tensor import visualize_video_tensor
+try:
+    from ..utils.visualize_video_tensor import visualize_video_tensor
+except ModuleNotFoundError:
+    def visualize_video_tensor(*args, **kwargs):
+        return None
 
 
 class WanVideoSviProPipeline(BasePipeline):
