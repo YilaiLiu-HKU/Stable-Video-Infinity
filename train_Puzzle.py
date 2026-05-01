@@ -17,7 +17,6 @@ import math
 import lightning as pl
 import re
 from collections import defaultdict, deque
-from peft import LoraConfig, inject_adapter_in_model
 from PIL import Image
 import numpy as np
 import random
@@ -51,7 +50,7 @@ from contextlib import suppress,contextmanager
 from safetensors.torch import load_file as safetensors_load_file
 
 from wan22_train_runtime import build_wan22_training_pipe
-from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
+from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d, modulate
 
 # Import attention extraction utilities
 sys.path.insert(0, os.path.dirname(__file__))
@@ -64,6 +63,75 @@ from test_svi_with_attention_version2 import (
 )
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+
+def _matches_lora_target(module_name, target_names):
+    for target in target_names:
+        target = str(target).strip()
+        if not target:
+            continue
+        if module_name == target or module_name.endswith(f".{target}"):
+            return True
+    return False
+
+
+def _install_train_lora_forward(module, rank, alpha, init_lora_weights=True, adapter_name=None):
+    if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+        return module
+    if not isinstance(module, torch.nn.Linear):
+        raise TypeError(f"Custom train LoRA currently supports only nn.Linear, got {type(module).__name__}")
+
+    weight_dtype = module.weight.dtype
+    weight_device = module.weight.device
+    rank = int(rank)
+    scale = float(alpha) / float(max(rank, 1))
+
+    lora_A = torch.nn.Linear(module.in_features, rank, bias=False, device=weight_device, dtype=weight_dtype)
+    lora_B = torch.nn.Linear(rank, module.out_features, bias=False, device=weight_device, dtype=weight_dtype)
+    if init_lora_weights:
+        torch.nn.init.kaiming_uniform_(lora_A.weight, a=math.sqrt(5))
+    else:
+        torch.nn.init.normal_(lora_A.weight, std=1.0 / max(rank, 1))
+    torch.nn.init.zeros_(lora_B.weight)
+
+    module.add_module("lora_A", lora_A)
+    module.add_module("lora_B", lora_B)
+    module.lora_alpha = float(alpha)
+    module.lora_rank = rank
+    module.lora_scale = scale
+    module.disable_adapters = False
+    module.lora_adapter_name = str(adapter_name) if adapter_name is not None else "default"
+    module._original_forward_before_lora = module.forward
+
+    def _train_lora_forward(this, x, *args, **kwargs):
+        out = this._original_forward_before_lora(x, *args, **kwargs)
+        if bool(getattr(this, "disable_adapters", False)):
+            return out
+        lora_in = x.to(dtype=this.lora_A.weight.dtype)
+        lora_out = this.lora_B(this.lora_A(lora_in))
+        return out + lora_out.to(dtype=out.dtype) * float(this.lora_scale)
+
+    module.forward = types.MethodType(_train_lora_forward, module)
+    return module
+
+
+def _inject_train_lora_modules(model, target_modules, lora_rank, lora_alpha, init_lora_weights=True, adapter_name=None):
+    injected = 0
+    target_modules = [str(x).strip() for x in target_modules if str(x).strip()]
+    for module_name, module in model.named_modules():
+        if not _matches_lora_target(module_name, target_modules):
+            continue
+        _install_train_lora_forward(
+            module,
+            rank=lora_rank,
+            alpha=lora_alpha,
+            init_lora_weights=init_lora_weights,
+            adapter_name=adapter_name,
+        )
+        injected += 1
+    if injected <= 0:
+        raise RuntimeError(f"No modules matched LoRA targets: {target_modules}")
+    return model
 
 
 def _load_checkpoint_payload(path):
@@ -6294,6 +6362,12 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                     image_emb[k] = v.to(device=self.device, dtype=self._vae_original_dtype)
                 else:
                     image_emb[k] = v
+            self._train_runtime_log(
+                'prepare_image_emb_precomputed',
+                keys=sorted(list(image_emb.keys())),
+                y=image_emb.get('y') if isinstance(image_emb, dict) else None,
+                clip_feature=image_emb.get('clip_feature') if isinstance(image_emb, dict) else None,
+            )
             return image_emb
 
         if "first_ref_frames" in batch and batch["first_ref_frames"] is not None:
@@ -6356,6 +6430,12 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
 
                 image_emb['num_condition_frames'] = num_condition_frames
                 self._train_runtime_log('after_encode_images_adaptive', y=image_emb.get('y') if isinstance(image_emb, dict) else None, clip_feature=image_emb.get('clip_feature') if isinstance(image_emb, dict) else None)
+                self._train_runtime_log(
+                    'prepare_image_emb_fresh',
+                    keys=sorted(list(image_emb.keys())),
+                    y=image_emb.get('y') if isinstance(image_emb, dict) else None,
+                    clip_feature=image_emb.get('clip_feature') if isinstance(image_emb, dict) else None,
+                )
 
                 for k in image_emb:
                     if isinstance(image_emb[k], torch.Tensor):
@@ -6392,23 +6472,15 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                           init_lora_weights="kaiming", pretrained_lora_path=None,
                           adapter_name=None):
         self.lora_alpha = lora_alpha
-        if init_lora_weights == "kaiming":
-            init_lora_weights = True
-        
-        lora_config = LoraConfig(
-            r=lora_rank,
-            lora_alpha=lora_alpha,
-            init_lora_weights=init_lora_weights,
+        use_kaiming = bool(init_lora_weights == "kaiming" or init_lora_weights is True)
+        model = _inject_train_lora_modules(
+            model,
             target_modules=lora_target_modules.split(","),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            init_lora_weights=use_kaiming,
+            adapter_name=adapter_name,
         )
-        try:
-            if adapter_name is not None:
-                model = inject_adapter_in_model(lora_config, model, adapter_name=adapter_name)
-            else:
-                model = inject_adapter_in_model(lora_config, model)
-        except TypeError:
-            # Backward compatibility for peft versions without adapter_name in inject API.
-            model = inject_adapter_in_model(lora_config, model)
         
         for param in model.parameters():
             if param.requires_grad:
@@ -6423,7 +6495,8 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
             
             state_dict_new = {}
             for key in state_dict:
-                state_dict_new[key] = state_dict[key]
+                mapped_key = key.replace(".lora_A.default.weight", ".lora_A.weight").replace(".lora_B.default.weight", ".lora_B.weight")
+                state_dict_new[mapped_key] = state_dict[key]
             
             model.load_state_dict(state_dict_new, strict=False)
 
@@ -6455,6 +6528,10 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
             if hasattr(module, 'set_adapter'):
                 with suppress(Exception):
                     module.set_adapter(adapter_name)
+                    changed = True
+            elif hasattr(module, 'lora_adapter_name'):
+                with suppress(Exception):
+                    module.disable_adapters = (str(getattr(module, 'lora_adapter_name', '')) != str(adapter_name))
                     changed = True
         return changed
 
@@ -6521,6 +6598,13 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
         device = noisy_latents.device
         noisy_latents = noisy_latents.to(device=device, dtype=model_dtype)
         context = context.to(device=device, dtype=model_dtype)
+        if y is None and bool(getattr(dit_model, 'has_image_input', False)):
+            expected_in = int(getattr(dit_model, 'in_dim', noisy_latents.shape[1]))
+            raise RuntimeError(
+                f"_dit_forward_with_memory_wrapper missing y for image-input model: "
+                f"noisy_latents_shape={tuple(noisy_latents.shape)}, noisy_channels={int(noisy_latents.shape[1])}, "
+                f"expected_in_dim={expected_in}, clip_feature_is_none={clip_feature is None}"
+            )
         if y is not None:
             y = y.to(device=device, dtype=model_dtype)
         if clip_feature is not None and isinstance(clip_feature, torch.Tensor):
@@ -6680,18 +6764,15 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
         grid_sizes = torch.tensor([[f, h, w]] * batch_size, device=device, dtype=torch.long)
 
         t_input = timestep
-        if t_input.dim() == 1:
-            t_input = t_input.expand(t_input.size(0), seq_len)
+        if t_input.dim() > 1:
+            t_input = t_input.reshape(t_input.shape[0], -1)[:, 0]
         with torch.amp.autocast('cuda', dtype=torch.float32):
-            bt = t_input.size(0)
-            t_flat = t_input.flatten()
             t_embed = dit_model.time_embedding(
-                sinusoidal_embedding_1d(dit_model.freq_dim, t_flat)
-                .unflatten(0, (bt, seq_len))
+                sinusoidal_embedding_1d(dit_model.freq_dim, t_input)
                 .float()
                 .to(device=device)
             )
-            t_seq = dit_model.time_projection(t_embed).unflatten(2, (6, dit_model.dim))
+            t_mod = dit_model.time_projection(t_embed).unflatten(1, (6, dit_model.dim))
 
         mem_input = memory_feature_tokens_selected.unsqueeze(0).expand(batch_size, -1, -1)
         if enable_sparse_context_only and int(mem_input.shape[1]) <= 0:
@@ -6808,23 +6889,17 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                 'attn_entropy': 0.0,
             }
             with torch.amp.autocast('cuda', dtype=model_dtype):
-                # Follow the 2.1 sparse training path here as well: keep the
-                # custom sparse-layer self-attn path on the model autocast
-                # dtype instead of forcing fp32 activations.
-                e_parts = (
-                    block_module.modulation.to(dtype=e_in.dtype, device=e_in.device).unsqueeze(0) + e_in
-                ).chunk(6, dim=2)
-                norm1 = block_module.norm1(x_in) * (1 + e_parts[1].squeeze(2)) + e_parts[0].squeeze(2)
-                y_self = block_module.self_attn(norm1, seq_lens, grid_sizes, freqs)
-                x_sa = x_in + y_self * e_parts[2].squeeze(2)
-            del norm1, y_self
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                    block_module.modulation.to(dtype=e_in.dtype, device=e_in.device) + e_in
+                ).chunk(6, dim=1)
+                input_x = modulate(block_module.norm1(x_in), shift_msa, scale_msa)
+                x_sa = x_in + gate_msa * block_module.self_attn(input_x, seq_lens, grid_sizes, freqs)
+            del input_x
 
             def _cross_attn_sparse_ffn(x_mid_in):
                 local_sparse_stats = sparse_stats
                 with torch.amp.autocast('cuda', dtype=model_dtype):
-                    norm3_in = block_module.norm3(x_mid_in)
-                    x_ca = x_mid_in + block_module.cross_attn(norm3_in, context_emb, context_lens)
-                del norm3_in
+                    x_ca = x_mid_in + block_module.cross_attn(block_module.norm3(x_mid_in), context_emb, context_lens)
 
                 if (
                     enable_sparse_context_only
@@ -6846,16 +6921,13 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                     )
 
                 with torch.amp.autocast('cuda', dtype=model_dtype):
-                    # Follow the 2.1 sparse training path here: avoid forcing the
-                    # custom sparse-layer FFN through an fp32 autocast region.
-                    ffn_in = block_module.norm2(x_ca) * (1 + e_parts[4].squeeze(2)) + e_parts[3].squeeze(2)
-                    y_ffn = block_module.ffn(ffn_in)
-                    x_out = x_ca + y_ffn * e_parts[5].squeeze(2)
-                del ffn_in, y_ffn, x_ca
+                    input_x2 = modulate(block_module.norm2(x_ca), shift_mlp, scale_mlp)
+                    x_out = x_ca + gate_mlp * block_module.ffn(input_x2)
+                del input_x2, x_ca
                 return x_out, local_sparse_stats
 
             x_out, sparse_stats = _cross_attn_sparse_ffn(x_sa)
-            del x_sa, e_parts
+            del x_sa
             return x_out, sparse_stats
 
         for layer_idx, block in enumerate(dit_model.blocks):
@@ -6878,7 +6950,7 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                 and hasattr(block, 'modulation')
             )
             if is_sparse_context_layer:
-                x_output, sparse_stats = _forward_block_with_sparse_context_only(block, x_output, t_seq)
+                x_output, sparse_stats = _forward_block_with_sparse_context_only(block, x_output, t_mod)
                 self._last_sparse_role_memory_stats = sparse_stats
                 query_feature_payload = None
                 query_role_boxes = None
@@ -6889,11 +6961,11 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                     return _forward_block_official(block, x_in, e_in)
                 if kwargs.get('use_gradient_checkpointing_offload', False):
                     with torch.autograd.graph.save_on_cpu():
-                        x_output = torch.utils.checkpoint.checkpoint(_custom_forward, x_output, t_seq, use_reentrant=False)
+                        x_output = torch.utils.checkpoint.checkpoint(_custom_forward, x_output, t_mod, use_reentrant=False)
                 else:
-                    x_output = torch.utils.checkpoint.checkpoint(_custom_forward, x_output, t_seq, use_reentrant=False)
+                    x_output = torch.utils.checkpoint.checkpoint(_custom_forward, x_output, t_mod, use_reentrant=False)
             else:
-                x_output = _forward_block_official(block, x_output, t_seq)
+                x_output = _forward_block_official(block, x_output, t_mod)
 
         for hook in hooks:
             hook.remove()
@@ -7150,6 +7222,12 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
             
             clip_feat = image_emb.pop('clip_feature', None)
             y_tensor = image_emb.pop('y', None)
+            self._train_runtime_log(
+                'train_step_image_condition_pop',
+                y=y_tensor,
+                clip_feature=clip_feat,
+                image_emb_keys=sorted(list(image_emb.keys())) if isinstance(image_emb, dict) else None,
+            )
             if isinstance(clip_feat, torch.Tensor):
                 clip_feat = clip_feat.to(device=self.device, dtype=model_dtype)
             if isinstance(y_tensor, torch.Tensor):

@@ -140,13 +140,22 @@ class WanDiffSynthVideoAdapter(nn.Module):
         self.base_model = base_model
         self.dim = base_model.dim
         self.freq_dim = base_model.freq_dim
+        self.in_dim = int(getattr(base_model, "in_dim", 0))
+        self.out_dim = int(getattr(base_model, "out_dim", 0))
         self.patch_size = tuple(base_model.patch_size)
         self.patch_embedding = base_model.patch_embedding
         self.text_embedding = base_model.text_embedding
         self.time_embedding = base_model.time_embedding
         self.time_projection = base_model.time_projection
         self.head = base_model.head
-        self.has_image_input = bool(getattr(base_model, "has_image_input", False))
+        # DiffSynth's Wan2.2-I2V config can expose `has_image_input=False`
+        # while still requiring concatenated VAE condition channels
+        # (`in_dim=36`, `out_dim=16`). Trust the channel contract first.
+        self.has_image_input = bool(
+            getattr(base_model, "has_image_input", False)
+            or (self.in_dim > self.out_dim > 0)
+            or bool(getattr(base_model, "require_vae_embedding", False))
+        )
         self.require_vae_embedding = bool(getattr(base_model, "require_vae_embedding", True))
         self.require_clip_embedding = bool(getattr(base_model, "require_clip_embedding", True))
         self.has_image_pos_emb = bool(getattr(base_model, "has_image_pos_emb", False))
@@ -209,6 +218,13 @@ class WanDiffSynthVideoAdapter(nn.Module):
         model_dtype = self.patch_embedding.weight.dtype
         x = x.to(dtype=model_dtype)
         context = context.to(device=x.device, dtype=model_dtype)
+        if y is None and self.has_image_input:
+            expected_in = int(getattr(self.base_model, "in_dim", x.shape[1]))
+            raise RuntimeError(
+                f"WanDiffSynthVideoAdapter.forward missing y for image-input model: "
+                f"x_shape={tuple(x.shape)}, x_channels={int(x.shape[1])}, expected_in_dim={expected_in}, "
+                f"clip_feature_is_none={clip_feature is None}"
+            )
         if y is not None:
             y = y.to(device=x.device, dtype=model_dtype)
             x = torch.cat([x, y], dim=1)
@@ -221,19 +237,14 @@ class WanDiffSynthVideoAdapter(nn.Module):
         seq_lens = torch.full((b,), seq_len, device=device, dtype=torch.long)
 
         t_input = timestep.to(device=device)
-        if t_input.dim() == 1:
-            t_input = t_input.expand(t_input.size(0), seq_len)
-        bt = t_input.size(0)
-        t_flat = t_input.flatten()
+        if t_input.dim() > 1:
+            t_input = t_input.reshape(t_input.shape[0], -1)[:, 0]
 
         with torch.amp.autocast("cuda", dtype=torch.float32):
             t_embed = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t_flat)
-                .unflatten(0, (bt, seq_len))
-                .float()
-                .to(device=device)
+                sinusoidal_embedding_1d(self.freq_dim, t_input).float().to(device=device)
             )
-            t_seq = self.time_projection(t_embed).unflatten(2, (6, self.dim))
+            t_mod = self.time_projection(t_embed).unflatten(1, (6, self.dim))
 
         with torch.amp.autocast("cuda", dtype=model_dtype):
             context_emb = self.text_embedding(context)
@@ -265,20 +276,20 @@ class WanDiffSynthVideoAdapter(nn.Module):
                             x = torch.utils.checkpoint.checkpoint(
                                 _custom_forward,
                                 x,
-                                t_seq,
+                                t_mod,
                                 use_reentrant=False,
                             )
                     else:
                         x = torch.utils.checkpoint.checkpoint(
                             _custom_forward,
                             x,
-                            t_seq,
+                            t_mod,
                             use_reentrant=False,
                         )
                 else:
                     x = block(
                         x,
-                        e=t_seq,
+                        e=t_mod,
                         seq_lens=seq_lens,
                         grid_sizes=grid_sizes,
                         freqs=self.freqs,
