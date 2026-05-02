@@ -12,7 +12,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from diffsynth.core.loader import ModelConfig
-from diffsynth.models.wan_video_dit import sinusoidal_embedding_1d
+from diffsynth.models.wan_video_dit import modulate, sinusoidal_embedding_1d
 from diffsynth.pipelines.wan_video_svi_pro import WanVideoSviProPipeline
 
 
@@ -101,8 +101,16 @@ class _DiffSynthSelfAttentionAdapter(nn.Module):
         self._freq_builder = freq_builder
 
     def forward(self, x, seq_lens=None, grid_sizes=None, freqs=None):
-        del seq_lens, freqs
-        expanded_freqs = self._freq_builder(grid_sizes, x.device)
+        del seq_lens
+        expanded_freqs = freqs
+        if expanded_freqs is None or (
+            torch.is_tensor(expanded_freqs)
+            and expanded_freqs.ndim >= 2
+            and int(expanded_freqs.shape[0]) != int(x.shape[1])
+        ):
+            expanded_freqs = self._freq_builder(grid_sizes, x.device)
+        elif torch.is_tensor(expanded_freqs) and expanded_freqs.device != x.device:
+            expanded_freqs = expanded_freqs.to(device=x.device)
         return self.base_attn(x, expanded_freqs)
 
 
@@ -110,10 +118,60 @@ class _DiffSynthCrossAttentionAdapter(nn.Module):
     def __init__(self, base_attn):
         super().__init__()
         self.base_attn = base_attn
+        self.save_attn_weights = False
+        self.target_token_idx = None
+        self.attn_weights = None
+        self.attn_capture_q_chunk_size = 256
+
+    def _capture_selected_text_attn(self, x, context):
+        target_idx = self.target_token_idx
+        if isinstance(target_idx, int):
+            target_idx = [int(target_idx)]
+        elif isinstance(target_idx, torch.Tensor):
+            target_idx = [int(t) for t in target_idx.detach().reshape(-1).tolist()]
+        elif isinstance(target_idx, (list, tuple)):
+            target_idx = [int(t) for t in target_idx]
+        else:
+            target_idx = []
+        if len(target_idx) <= 0:
+            self.attn_weights = None
+            return
+
+        base = self.base_attn
+        if bool(getattr(base, "has_image_input", False)):
+            ctx = context[:, 257:]
+        else:
+            ctx = context
+        lk = int(ctx.shape[1])
+        target_idx = [idx for idx in target_idx if 0 <= idx < lk]
+        if len(target_idx) <= 0:
+            self.attn_weights = None
+            return
+
+        with torch.no_grad():
+            b = int(x.shape[0])
+            n = int(base.num_heads)
+            d = int(base.head_dim)
+            selected_idx = torch.tensor(target_idx, device=x.device, dtype=torch.long)
+            q = base.norm_q(base.q(x)).view(b, -1, n, d).permute(0, 2, 1, 3).float()
+            k = base.norm_k(base.k(ctx)).view(b, -1, n, d).permute(0, 2, 1, 3).float()
+            scale = float(d) ** -0.5
+            q_chunk_size = max(1, int(getattr(self, "attn_capture_q_chunk_size", 256)))
+            chunks = []
+            for q_start in range(0, int(q.shape[2]), q_chunk_size):
+                q_end = min(q_start + q_chunk_size, int(q.shape[2]))
+                logits = torch.einsum("bhqd,bhkd->bhqk", q[:, :, q_start:q_end, :], k) * scale
+                attn = torch.softmax(logits, dim=-1).index_select(-1, selected_idx)
+                chunks.append(attn.detach().to(device="cpu", dtype=x.dtype))
+                del logits, attn
+            self.attn_weights = torch.cat(chunks, dim=2) if chunks else None
 
     def forward(self, x, context, context_lens=None):
         del context_lens
-        return self.base_attn(x, context)
+        out = self.base_attn(x, context)
+        if bool(getattr(self, "save_attn_weights", False)):
+            self._capture_selected_text_attn(x, context)
+        return out
 
 
 class _DiffSynthBlockAdapter(nn.Module):
@@ -129,9 +187,34 @@ class _DiffSynthBlockAdapter(nn.Module):
         self.modulation = base_block.modulation
 
     def forward(self, x, e, seq_lens, grid_sizes, freqs, context, context_lens):
-        del seq_lens, freqs, context_lens
-        expanded_freqs = self.self_attn._freq_builder(grid_sizes, x.device)
-        return self.base_block(x, context, e, expanded_freqs)
+        del seq_lens, context_lens
+        expanded_freqs = freqs
+        if expanded_freqs is None or (
+            torch.is_tensor(expanded_freqs)
+            and expanded_freqs.ndim >= 2
+            and int(expanded_freqs.shape[0]) != int(x.shape[1])
+        ):
+            expanded_freqs = self.self_attn._freq_builder(grid_sizes, x.device)
+        elif torch.is_tensor(expanded_freqs) and expanded_freqs.device != x.device:
+            expanded_freqs = expanded_freqs.to(device=x.device)
+
+        has_seq = len(e.shape) == 4
+        chunk_dim = 2 if has_seq else 1
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.modulation.to(dtype=e.dtype, device=e.device) + e
+        ).chunk(6, dim=chunk_dim)
+        if has_seq:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2),
+                shift_mlp.squeeze(2), scale_mlp.squeeze(2), gate_mlp.squeeze(2),
+            )
+
+        input_x = modulate(self.norm1(x), shift_msa, scale_msa)
+        x = x + gate_msa * self.self_attn(input_x, grid_sizes=grid_sizes, freqs=expanded_freqs)
+        x = x + self.cross_attn(self.norm3(x), context)
+        input_x = modulate(self.norm2(x), shift_mlp, scale_mlp)
+        x = x + gate_mlp * self.ffn(input_x)
+        return x
 
 
 class WanDiffSynthVideoAdapter(nn.Module):
@@ -245,9 +328,12 @@ class WanDiffSynthVideoAdapter(nn.Module):
                 sinusoidal_embedding_1d(self.freq_dim, t_input).float().to(device=device)
             )
             t_mod = self.time_projection(t_embed).unflatten(1, (6, self.dim))
+        if t_mod.dtype != model_dtype:
+            t_mod = t_mod.to(dtype=model_dtype)
 
         with torch.amp.autocast("cuda", dtype=model_dtype):
             context_emb = self.text_embedding(context)
+            freqs = self._expand_freqs(grid_sizes, device)
             if (
                 self.has_image_input
                 and clip_feature is not None
@@ -266,7 +352,7 @@ class WanDiffSynthVideoAdapter(nn.Module):
                             e=e_in,
                             seq_lens=seq_lens,
                             grid_sizes=grid_sizes,
-                            freqs=self.freqs,
+                            freqs=freqs,
                             context=context_emb,
                             context_lens=None,
                         )
@@ -292,7 +378,7 @@ class WanDiffSynthVideoAdapter(nn.Module):
                         e=t_mod,
                         seq_lens=seq_lens,
                         grid_sizes=grid_sizes,
-                        freqs=self.freqs,
+                        freqs=freqs,
                         context=context_emb,
                         context_lens=None,
                     )
@@ -329,18 +415,13 @@ class WanTrainPipelineAdapter:
         text_encoder_path = os.path.join(ckpt_dir, "models_t5_umt5-xxl-enc-bf16.pth")
         vae_path = os.path.join(ckpt_dir, "Wan2.1_VAE.pth")
         tokenizer_path = os.path.join(ckpt_dir, "google", "umt5-xxl")
-        image_encoder_path = os.path.join(
-            ckpt_dir, "models_clip_open-clip-xlm-roberta-large-vit-huge-14.pth"
-        )
 
+        active_noise_paths = high_noise_paths if self.train_noise_domain == "high_noise" else low_noise_paths
         model_configs = [
-            ModelConfig(path=high_noise_paths, offload_device="cpu"),
-            ModelConfig(path=low_noise_paths, offload_device="cpu"),
+            ModelConfig(path=active_noise_paths, offload_device="cpu"),
             ModelConfig(path=text_encoder_path, offload_device="cpu"),
             ModelConfig(path=vae_path, offload_device="cpu"),
         ]
-        if os.path.exists(image_encoder_path):
-            model_configs.append(ModelConfig(path=image_encoder_path, offload_device="cpu"))
 
         raw_pipe = WanVideoSviProPipeline.from_pretrained(
             torch_dtype=torch_dtype,
@@ -355,8 +436,17 @@ class WanTrainPipelineAdapter:
         self.prompter = WanPrompterAdapter(raw_pipe)
         self.vae = raw_pipe.vae
         self.image_encoder = raw_pipe.image_encoder
-        self.high_noise_model = WanDiffSynthVideoAdapter(raw_pipe.dit) if raw_pipe.dit is not None else None
-        self.low_noise_model = WanDiffSynthVideoAdapter(raw_pipe.dit2) if raw_pipe.dit2 is not None else None
+        active_model = WanDiffSynthVideoAdapter(raw_pipe.dit) if raw_pipe.dit is not None else None
+        self.high_noise_model = active_model if self.train_noise_domain == "high_noise" else None
+        self.low_noise_model = active_model if self.train_noise_domain == "low_noise" else None
+        inactive_model = self.low_noise_model if self.train_noise_domain == "high_noise" else self.high_noise_model
+        if inactive_model is not None:
+            inactive_dtype, inactive_device = _get_module_dtype_device(inactive_model)
+            if inactive_device.type == "cuda":
+                raise RuntimeError(
+                    f"Inactive Wan2.2 expert is unexpectedly on GPU ({inactive_device}, {inactive_dtype}); "
+                    f"training runtime should only load the active {self.train_noise_domain} expert."
+                )
         self.dit = None
         self.set_active_noise_domain(self.train_noise_domain)
         self.training = True
@@ -407,8 +497,9 @@ class WanTrainPipelineAdapter:
         use_first_aug=False,
         ref_pad_cfg=False,
         ref_pad_num=None,
+        num_motion_latent=None,
     ):
-        del random_ref_frame, use_first_aug, ref_pad_cfg, ref_pad_num
+        del random_ref_frame, use_first_aug, ref_pad_cfg, ref_pad_num, num_motion_latent
         if not first_frames:
             raise ValueError("encode_images_adaptive requires at least one frame")
 

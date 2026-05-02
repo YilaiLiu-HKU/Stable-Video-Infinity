@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-5,4}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3,2}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export TOKENIZERS_PARALLELISM=false
@@ -50,8 +50,9 @@ common_args=(
   --patch_dim 5120
   --projector_bottleneck 256
   --num_frames 81
-  --num_motion_frames 5
-  --ref_pad_num 1
+  --num_overlap_frame 5
+  --num_motion_latent 1
+  --ref_pad_num 0
   --use_gradient_checkpointing
   --use_gradient_checkpointing_offload
   --aggressive_vram_optimization
@@ -65,7 +66,7 @@ common_args=(
   --offload_image_encoder_after_extraction
   --no-keep_image_encoder_on_gpu
   --memory_injection_mode "context_only"
-  --sparse_role_memory_layer_idx 7
+  --sparse_role_memory_injection_layers "7"
   --sparse_role_memory_num_heads 8
   --sparse_role_memory_head_dim 128
   --train_stage stage2

@@ -363,6 +363,8 @@ class WanModel(torch.nn.Module):
         t = self.time_embedding(
             sinusoidal_embedding_1d(self.freq_dim, timestep).to(x.dtype))
         t_mod = self.time_projection(t).unflatten(1, (6, self.dim))
+        if t_mod.dtype != x.dtype:
+            t_mod = t_mod.to(dtype=x.dtype)
         context = self.text_embedding(context)
         
         if self.has_image_input:

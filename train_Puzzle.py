@@ -107,7 +107,8 @@ def _install_train_lora_forward(module, rank, alpha, init_lora_weights=True, ada
         out = this._original_forward_before_lora(x, *args, **kwargs)
         if bool(getattr(this, "disable_adapters", False)):
             return out
-        lora_in = x.to(dtype=this.lora_A.weight.dtype)
+        lora_dtype = this.lora_A.weight.dtype
+        lora_in = x if x.dtype == lora_dtype else x.to(dtype=lora_dtype)
         lora_out = this.lora_B(this.lora_A(lora_in))
         return out + lora_out.to(dtype=out.dtype) * float(this.lora_scale)
 
@@ -139,6 +140,27 @@ def _load_checkpoint_payload(path):
     if path.endswith(".safetensors"):
         return safetensors_load_file(path)
     return torch.load(path, map_location="cpu")
+
+
+def _parse_layer_indices_csv(value, fallback_idx=7):
+    fallback = [int(fallback_idx)]
+    if value is None:
+        return fallback
+    if isinstance(value, int):
+        return [int(value)]
+    if isinstance(value, (list, tuple, set)):
+        raw_parts = list(value)
+    else:
+        raw_parts = [p.strip() for p in str(value).split(",") if str(p).strip() != ""]
+    out = []
+    for p in raw_parts:
+        try:
+            v = int(p)
+        except Exception:
+            continue
+        if v >= 0 and v not in out:
+            out.append(v)
+    return out if len(out) > 0 else fallback
 
 
 def _append_extract_debug_event(events, **payload):
@@ -433,7 +455,7 @@ def _safe_vae_encode_isolated(vae, videos, device=None, op_name='vae.encode', **
         _reset_module_runtime_caches(vae)
 
 
-def _patched_encode_images_adaptive(self, first_frames, random_ref_frame, num_frames, height, width, use_first_aug=False, ref_pad_cfg=False, ref_pad_num=None):
+def _patched_encode_images_adaptive(self, first_frames, random_ref_frame, num_frames, height, width, use_first_aug=False, ref_pad_cfg=False, ref_pad_num=None, num_motion_latent=None):
     """TP2DP2-local patch for SVI pipeline image conditioning.
 
     Keep all fixes inside tp2dp2.py instead of editing diffsynth/pipelines/svi_video.py.
@@ -448,16 +470,19 @@ def _patched_encode_images_adaptive(self, first_frames, random_ref_frame, num_fr
     if random_ref_frame is None:
         random_ref_frame = first_frames[0]
 
-    image_encoder = getattr(self, 'image_encoder', None)
     vae = getattr(self, 'vae', None)
-    if image_encoder is None or vae is None:
-        raise RuntimeError('encode_images_adaptive requires both image_encoder and vae')
+    image_encoder = getattr(self, 'image_encoder', None)
+    dit = getattr(self, 'dit', None)
+    require_clip_embedding = bool(getattr(dit, 'require_clip_embedding', False))
+    use_clip_feature = bool(image_encoder is not None and require_clip_embedding)
+    if vae is None:
+        raise RuntimeError('encode_images_adaptive requires vae')
 
     vae_dtype, vae_device = _get_module_dtype_device(vae, default_device=pipe_device, default_dtype=original_dtype)
-    image_dtype, image_device = _get_module_dtype_device(image_encoder, default_device=pipe_device, default_dtype=original_dtype)
+    image_dtype, image_device = _get_module_dtype_device(image_encoder, default_device=pipe_device, default_dtype=original_dtype) if use_clip_feature else (None, pipe_device)
     if vae_dtype is None:
         vae_dtype = original_dtype
-    if image_dtype is None:
+    if use_clip_feature and image_dtype is None:
         image_dtype = original_dtype
     vae_device = torch.device(vae_device) if vae_device is not None else pipe_device
     image_device = torch.device(image_device) if image_device is not None else pipe_device
@@ -466,23 +491,25 @@ def _patched_encode_images_adaptive(self, first_frames, random_ref_frame, num_fr
     remaining_frames = num_frames - num_condition_frames
 
     random_ref_tensor = self.preprocess_image(random_ref_frame.resize((width, height))).to(device=vae_device, dtype=vae_dtype)
-    first_frame_base = self.preprocess_image(first_frames[0].resize((width, height))).to(device=image_device)
-    first_frame_tensor = first_frame_base.to(dtype=image_dtype)
-    try:
-        clip_context = image_encoder.encode_image([first_frame_tensor])
-    except RuntimeError as e:
-        if not _is_dtype_mismatch_error(e):
-            raise
-        retry_image_dtype = _pick_alternate_fp_dtype(first_frame_tensor.dtype)
-        retry_image_dtype, retry_image_device = _get_module_dtype_device(
-            image_encoder,
-            default_device=image_device,
-            default_dtype=retry_image_dtype,
-        )
-        retry_image_device = torch.device(retry_image_device) if retry_image_device is not None else image_device
-        clip_context = image_encoder.encode_image([
-            first_frame_base.to(device=retry_image_device, dtype=retry_image_dtype)
-        ])
+    clip_context = None
+    if use_clip_feature:
+        first_frame_base = self.preprocess_image(first_frames[0].resize((width, height))).to(device=image_device)
+        first_frame_tensor = first_frame_base.to(dtype=image_dtype)
+        try:
+            clip_context = image_encoder.encode_image([first_frame_tensor])
+        except RuntimeError as e:
+            if not _is_dtype_mismatch_error(e):
+                raise
+            retry_image_dtype = _pick_alternate_fp_dtype(first_frame_tensor.dtype)
+            retry_image_dtype, retry_image_device = _get_module_dtype_device(
+                image_encoder,
+                default_device=image_device,
+                default_dtype=retry_image_dtype,
+            )
+            retry_image_device = torch.device(retry_image_device) if retry_image_device is not None else image_device
+            clip_context = image_encoder.encode_image([
+                first_frame_base.to(device=retry_image_device, dtype=retry_image_dtype)
+            ])
 
     msk = torch.ones(1, num_frames, height // 8, width // 8, device=vae_device, dtype=vae_dtype)
     if ref_pad_cfg:
@@ -539,9 +566,17 @@ def _patched_encode_images_adaptive(self, first_frames, random_ref_frame, num_fr
             op_name='encode_images_adaptive.vae.encode.retry',
         )[0]
 
+    if num_motion_latent is not None:
+        keep_motion = max(0, int(num_motion_latent))
+        keep_latents = min(int(y_latent.shape[1]), 1 + keep_motion)
+        if keep_latents < int(y_latent.shape[1]):
+            zero_pad = torch.zeros_like(y_latent[:, keep_latents:])
+            y_latent = torch.cat([y_latent[:, :keep_latents], zero_pad], dim=1)
+
     y = torch.concat([msk.to(device=y_latent.device, dtype=y_latent.dtype), y_latent], dim=0).unsqueeze(0)
 
-    clip_context = clip_context.to(dtype=original_dtype, device=pipe_device)
+    if clip_context is not None:
+        clip_context = clip_context.to(dtype=original_dtype, device=pipe_device)
     y = y.to(dtype=original_dtype, device=pipe_device)
     return {'clip_feature': clip_context, 'y': y}
 
@@ -550,11 +585,6 @@ def _install_tp2dp2_pipeline_only_patch(pipe):
     if pipe is None:
         return None
     if getattr(pipe, '_tp2dp2_pipeline_only_patch_installed', False):
-        return pipe
-    # Official Wan2.2 runtime already provides the right I2V condition path.
-    # Do not overwrite it with the legacy diffsynth-specific adapter.
-    if getattr(pipe, 'image_encoder', None) is None:
-        pipe._tp2dp2_pipeline_only_patch_installed = True
         return pipe
     pipe.encode_images_adaptive = types.MethodType(_patched_encode_images_adaptive, pipe)
     pipe._tp2dp2_pipeline_only_patch_installed = True
@@ -668,6 +698,7 @@ class SharedVAEPipelineView:
         use_first_aug=False,
         ref_pad_cfg=False,
         ref_pad_num=None,
+        num_motion_latent=None,
     ):
         self.base_pipe.device = self.device
         self.base_pipe.torch_dtype = self.torch_dtype
@@ -680,6 +711,7 @@ class SharedVAEPipelineView:
             use_first_aug=use_first_aug,
             ref_pad_cfg=ref_pad_cfg,
             ref_pad_num=ref_pad_num,
+            num_motion_latent=num_motion_latent,
         )
 
 
@@ -5016,6 +5048,9 @@ class InlineExtractThenTrainDataset(IterableDataset):
 
                 condition_frames = pil_first_ref_frames[:1]
                 num_motion_frames = int(self.extract_config.get('num_motion_frames', 1) or 1)
+                num_overlap_frame = int(self.extract_config.get('num_overlap_frame', 0) or 0)
+                if num_overlap_frame > 0:
+                    num_motion_frames = max(num_motion_frames, num_overlap_frame)
                 p_motion_threshold = float(self.extract_config.get('p_motion_threshold', 0.9) or 0.9)
                 repeat_first_frame = bool(self.extract_config.get('repeat_first_frame', False))
                 if num_motion_frames > 1 and len(pil_first_ref_frames) > 0:
@@ -5035,6 +5070,7 @@ class InlineExtractThenTrainDataset(IterableDataset):
                     use_first_aug=bool(self.extract_config.get('use_first_aug', False)),
                     ref_pad_cfg=bool(self.extract_config.get('ref_pad_cfg', False)),
                     ref_pad_num=int(self.extract_config.get('ref_pad_num', 0) or 0),
+                    num_motion_latent=self.extract_config.get('num_motion_latent', None),
                 )
 
                 precomputed_image_emb = {'num_condition_frames': num_condition_frames}
@@ -5319,6 +5355,10 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
         self._active_noise_lora_adapter = None
         self.enable_sparse_role_memory_attn = bool(getattr(args, 'enable_sparse_role_memory_attn', True)) if args else True
         self.sparse_role_memory_layer_idx = int(getattr(args, 'sparse_role_memory_layer_idx', 7)) if args else 7
+        self.sparse_role_memory_injection_layers = _parse_layer_indices_csv(
+            getattr(args, 'sparse_role_memory_injection_layers', None) if args else None,
+            fallback_idx=self.sparse_role_memory_layer_idx,
+        )
         self.sparse_role_memory_num_heads = int(getattr(args, 'sparse_role_memory_num_heads', 8)) if args else 8
         self.sparse_role_memory_head_dim = int(getattr(args, 'sparse_role_memory_head_dim', 128)) if args else 128
         self.sparse_role_memory_rope_dim = int(getattr(args, 'sparse_role_memory_rope_dim', 256)) if args else 256
@@ -5349,7 +5389,11 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
         self.use_first_aug = getattr(args, 'use_first_aug', False)
         self.ref_pad_num = getattr(args, 'ref_pad_num', 0)
         self.ref_pad_cfg = getattr(args, 'ref_pad_cfg', False)
+        self.num_overlap_frame = int(getattr(args, 'num_overlap_frame', 0) or 0)
+        self.num_motion_latent = getattr(args, 'num_motion_latent', None)
         self.num_motion_frames = getattr(args, 'num_motion_frames', 1)
+        if self.num_overlap_frame > 0:
+            self.num_motion_frames = max(int(self.num_motion_frames), int(self.num_overlap_frame))
         self.p_motion_threshold = getattr(args, 'p_motion_threshold', 0.9)
         self.repeat_first_frame = getattr(args, 'repeat_first_frame', False)
         self.y_error_num = getattr(args, 'y_error_num', 1)
@@ -6398,11 +6442,14 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
 
                 condition_frames = first_ref_frames[:1]
 
-                if self.num_motion_frames > 1:
+                num_motion_frames = int(self.num_motion_frames)
+                if self.num_overlap_frame > 0:
+                    num_motion_frames = max(num_motion_frames, int(self.num_overlap_frame))
+                if num_motion_frames > 1:
                     if random.random() < self.p_motion_threshold:
-                        condition_frames = first_ref_frames[:self.num_motion_frames]
+                        condition_frames = first_ref_frames[:num_motion_frames]
                     elif self.repeat_first_frame:
-                        condition_frames = [first_ref_frames[0]] * self.num_motion_frames
+                        condition_frames = [first_ref_frames[0]] * num_motion_frames
 
                 num_condition_frames = len(condition_frames)
 
@@ -6425,7 +6472,8 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                     rand_ref_frame,
                     num_frames * 4 - 3, height * 8, width * 8,
                     use_first_aug=self.use_first_aug, ref_pad_cfg=self.ref_pad_cfg,
-                    ref_pad_num=self.ref_pad_num
+                    ref_pad_num=self.ref_pad_num,
+                    num_motion_latent=self.num_motion_latent,
                 )
 
                 image_emb['num_condition_frames'] = num_condition_frames
@@ -6499,6 +6547,25 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                 state_dict_new[mapped_key] = state_dict[key]
             
             model.load_state_dict(state_dict_new, strict=False)
+
+    def _collect_active_denoising_trainable_state_dict(self):
+        if not hasattr(self, "pipe") or self.pipe is None:
+            return {}
+        state_dict = {}
+        seen_params = set()
+        for model_name in ("low_noise_model", "high_noise_model"):
+            model = getattr(self.pipe, model_name, None)
+            if model is None:
+                continue
+            for name, param in model.named_parameters():
+                if not getattr(param, "requires_grad", False):
+                    continue
+                param_id = id(param)
+                if param_id in seen_params:
+                    continue
+                seen_params.add(param_id)
+                state_dict[name] = param.detach().cpu().clone()
+        return state_dict
 
     def _resolve_noise_domain_from_timestep(self, timestep):
         del timestep
@@ -6773,6 +6840,8 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                 .to(device=device)
             )
             t_mod = dit_model.time_projection(t_embed).unflatten(1, (6, dit_model.dim))
+        if t_mod.dtype != model_dtype:
+            t_mod = t_mod.to(dtype=model_dtype)
 
         mem_input = memory_feature_tokens_selected.unsqueeze(0).expand(batch_size, -1, -1)
         if enable_sparse_context_only and int(mem_input.shape[1]) <= 0:
@@ -6827,7 +6896,9 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                 )
 
         freqs = dit_model.freqs
-        if freqs.device != device:
+        if hasattr(dit_model, '_expand_freqs'):
+            freqs = dit_model._expand_freqs(grid_sizes, device)
+        elif freqs.device != device:
             freqs = freqs.to(device)
         context_emb = dit_model.text_embedding(context)
         if (
@@ -6863,7 +6934,13 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
             'plain_head_out_norm': 0.0,
             'attn_entropy': 0.0,
         }
-        sparse_layer_idx = int(getattr(self, 'sparse_role_memory_layer_idx', 7))
+        sparse_layer_indices = set(
+            int(x) for x in getattr(self, 'sparse_role_memory_injection_layers', [getattr(self, 'sparse_role_memory_layer_idx', 7)])
+            if int(x) >= 0
+        )
+        if len(sparse_layer_indices) == 0:
+            sparse_layer_indices = {int(getattr(self, 'sparse_role_memory_layer_idx', 7))}
+        last_sparse_layer_idx = max(sparse_layer_indices)
         sparse_timestep_percent = float((timestep.detach().float() / float(max(int(self.pipe.scheduler.num_train_timesteps), 1))).clamp(0.0, 1.0).mean().item())
 
         def _forward_block_official(block_module, x_in, e_in):
@@ -6940,7 +7017,7 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                 )
             is_sparse_context_layer = (
                 enable_sparse_context_only
-                and int(layer_idx) == int(sparse_layer_idx)
+                and int(layer_idx) in sparse_layer_indices
                 and hasattr(block, 'self_attn')
                 and hasattr(block, 'cross_attn')
                 and hasattr(block, 'ffn')
@@ -6952,9 +7029,10 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
             if is_sparse_context_layer:
                 x_output, sparse_stats = _forward_block_with_sparse_context_only(block, x_output, t_mod)
                 self._last_sparse_role_memory_stats = sparse_stats
-                query_feature_payload = None
-                query_role_boxes = None
-                memory_tokens_for_sparse = None
+                if int(layer_idx) >= int(last_sparse_layer_idx):
+                    query_feature_payload = None
+                    query_role_boxes = None
+                    memory_tokens_for_sparse = None
                 continue
             if self.training and kwargs.get('use_gradient_checkpointing', False):
                 def _custom_forward(x_in, e_in):
@@ -7476,6 +7554,9 @@ class LightningModelForTrainWithMemoryV4(pl.LightningModule):
                                         for n, p in self.named_parameters()
                                         if p.requires_grad and not n.startswith("memory_projector.")}
 
+                    denoising_lora_state_dict = self._collect_active_denoising_trainable_state_dict()
+                    lora_state_dict.update(denoising_lora_state_dict)
+
                     if hasattr(self, "memory_embeddings") and self.memory_embeddings is not None:
                         if getattr(self.memory_embeddings, "pos_embed", None) is not None:
                             lora_state_dict["memory_pos_embed"] = self.memory_embeddings.pos_embed.data.detach().cpu().clone()
@@ -7697,6 +7778,8 @@ def parse_args():
     parser.add_argument("--error_modulate_factor", type=float, default=0.0)
     parser.add_argument("--ref_pad_num", type=int, default=0)
     parser.add_argument("--num_motion_frames", type=int, default=1)
+    parser.add_argument("--num_overlap_frame", type=int, default=0)
+    parser.add_argument("--num_motion_latent", type=int, default=None)
     parser.add_argument("--p_motion_threshold", type=float, default=0.9)
     parser.add_argument("--y_error_num", type=int, default=1)
     parser.add_argument("--y_error_sample_from_all_grids", action="store_true")
@@ -7841,6 +7924,9 @@ def parse_args():
                         help="Enable standalone sparse role-aware memory cross-attention branch for context_only mode.")
     parser.add_argument("--sparse_role_memory_layer_idx", type=int, default=7,
                         help="Target DiT layer index for sparse role-aware memory branch insertion.")
+    parser.add_argument("--sparse_role_memory_injection_layers", type=str, default=None,
+                        help="Comma-separated DiT layer indices for sparse role-aware memory branch insertion. "
+                             "If unset, falls back to --sparse_role_memory_layer_idx.")
     parser.add_argument("--char_attn_noise_scope", type=str, default="low_noise", choices=["high_noise", "low_noise"],
                         help="Enable char-attn + memory path on which noise domain(s). If low_noise/high_noise only, the other domain trains as base LoRA without memory/char-attn.")
     parser.add_argument("--sparse_role_memory_num_heads", type=int, default=8,
@@ -8080,6 +8166,7 @@ def train_svi_with_memory_v4(args):
         'memory_similarity_mode': args.memory_similarity_mode,
         'memory_injection_mode': args.memory_injection_mode,
         'enable_sparse_role_memory_attn': args.enable_sparse_role_memory_attn,
+        'sparse_role_memory_injection_layers': args.sparse_role_memory_injection_layers,
         'sparse_role_memory_query_topk_mode': args.sparse_role_memory_query_topk_mode,
         'sparse_role_memory_query_topk': args.sparse_role_memory_query_topk,
         'sparse_role_memory_query_merge_mode': args.sparse_role_memory_query_merge_mode,
@@ -8100,7 +8187,7 @@ def train_svi_with_memory_v4(args):
         'neighbor_filter_any_window': args.neighbor_filter_any_window,
         'enable_viz_extraction': False,
         'perf_log_interval': args.perf_log_interval,
-        'max_ref_frames_for_train': max(1, int(args.num_motion_frames)),
+        'max_ref_frames_for_train': max(1, int(args.num_motion_frames), int(args.num_overlap_frame)),
         'precompute_image_emb': args.precompute_image_emb,
         'precompute_image_emb_strict': args.precompute_image_emb_strict,
         'offload_image_encoder_after_extraction': args.offload_image_encoder_after_extraction,
@@ -8117,6 +8204,8 @@ def train_svi_with_memory_v4(args):
         'enable_rank_heartbeat': args.enable_rank_heartbeat,
         'rank_heartbeat_interval_sec': args.rank_heartbeat_interval_sec,
         'num_motion_frames': args.num_motion_frames,
+        'num_overlap_frame': args.num_overlap_frame,
+        'num_motion_latent': args.num_motion_latent,
         'p_motion_threshold': args.p_motion_threshold,
         'repeat_first_frame': args.repeat_first_frame,
         'use_first_aug': args.use_first_aug,

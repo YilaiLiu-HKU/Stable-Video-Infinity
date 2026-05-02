@@ -113,8 +113,10 @@ noise_domain_boundary_ratio: 0.9
 noise_prob: 0.9
 num_frames: 81
 num_grids: 50
-num_motion_frames: 5
+num_motion_frames: 1
+num_motion_latent: 1
 num_nodes: 1
+num_overlap_frame: 5
 num_train_gpus: 2
 offload_detached_extractor_after_extraction: null
 offload_image_encoder_after_extraction: true
@@ -135,7 +137,7 @@ projector_bottleneck: 256
 prompt_drop_prob: 0.0
 rank_heartbeat_interval_sec: 30
 ref_pad_cfg: false
-ref_pad_num: 1
+ref_pad_num: 0
 repeat_first_frame: false
 resume_weights_from_ds_ckpt: null
 role_token_selection_mode: two_role_diff
@@ -144,6 +146,7 @@ seed: -1
 sparse_role_memory_feature_source: attn_out
 sparse_role_memory_head_dim: 128
 sparse_role_memory_init_scale: 0.1
+sparse_role_memory_injection_layers: '7'
 sparse_role_memory_layer_idx: 7
 sparse_role_memory_merge_bucket_h: 4
 sparse_role_memory_merge_bucket_k: 5
