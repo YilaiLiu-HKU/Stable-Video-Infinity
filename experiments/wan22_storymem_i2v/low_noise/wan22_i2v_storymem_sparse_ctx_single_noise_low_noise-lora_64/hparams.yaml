@@ -8,7 +8,7 @@ cfg_scale_extraction: 5.0
 char_attn_noise_scope: low_noise
 character_lists_dir: /data/yilai/sample_dataset/character_lists
 checkpoint_save_every_n_epochs: 0
-checkpoint_save_every_n_steps: 500
+checkpoint_save_every_n_steps: 5
 ckpt_dir: /data/yilai/video_model/models/Wan2.2-I2V-A14B
 ckpt_path: null
 clean_buffer_update_prob: 0.1
@@ -82,8 +82,8 @@ lora_target_modules: q,k,v,o,ffn.0,ffn.2
 low_noise_lora_adapter_name: low_noise
 max_epochs: 100
 max_memory_characters: 2
-max_memory_tokens_per_character: 64
-max_steps: 1600
+max_memory_tokens_per_character: 128
+max_steps: 6
 memory_alpha_abc: 0.10,0.30,0.15
 memory_bank_percents: 0.85,0.60,0.35,0.12
 memory_drop_prob: 0.0
@@ -146,7 +146,7 @@ seed: -1
 sparse_role_memory_feature_source: attn_out
 sparse_role_memory_head_dim: 128
 sparse_role_memory_init_scale: 0.1
-sparse_role_memory_injection_layers: '7'
+sparse_role_memory_injection_layers: '3'
 sparse_role_memory_layer_idx: 7
 sparse_role_memory_merge_bucket_h: 4
 sparse_role_memory_merge_bucket_k: 5

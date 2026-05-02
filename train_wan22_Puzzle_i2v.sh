@@ -66,7 +66,7 @@ common_args=(
   --offload_image_encoder_after_extraction
   --no-keep_image_encoder_on_gpu
   --memory_injection_mode "context_only"
-  --sparse_role_memory_injection_layers "7"
+  --sparse_role_memory_injection_layers "3"
   --sparse_role_memory_num_heads 8
   --sparse_role_memory_head_dim 128
   --train_stage stage2
@@ -83,7 +83,7 @@ common_args=(
   --cfg_scale_extraction 5.0
   --max_memory_characters 2
   --neighbor_filter_kernel 5
-  --max_memory_tokens_per_character 64
+  --max_memory_tokens_per_character 128
   --memory_bank_percents "0.85,0.60,0.35,0.12"
   --prompt_drop_prob 0.0
   --memory_drop_prob 0.0
@@ -166,7 +166,7 @@ run_phase \
   "high_noise" \
   "high_noise" \
   "0" \
-  "500" \
+  "600" \
   "${OUTPUT_ROOT}/high_noise" \
   "${EXP_PREFIX_BASE}_high_noise" \
   "${HIGH_LORA_INIT_PATH}"
@@ -176,7 +176,7 @@ run_phase \
   "high_noise" \
   "high_noise" \
   "1" \
-  "500" \
+  "600" \
   "${OUTPUT_ROOT}/high_noise_with_char_attn_ablation" \
   "${EXP_PREFIX_BASE}_high_noise_with_char_attn_ablation" \
   "${HIGH_LORA_INIT_PATH}"
